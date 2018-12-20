@@ -273,12 +273,14 @@ func CollectShowqFromSocket(path string, ch chan<- prometheus.Metric) error {
 
 // Patterns for parsing log messages.
 var (
-	logLine                             = regexp.MustCompile(` ?postfix/(\w+)\[\d+\]: (.*)`)
+	logLine                             = regexp.MustCompile(` ?postfix.*/(\w+)\[\d+\]: (.*)`)
+	multiInstance                       = regexp.MustCompile(` ?postfix-(\S+)/.*`)
 	lmtpPipeSMTPLine                    = regexp.MustCompile(`, relay=(\S+), .*, delays=([0-9\.]+)/([0-9\.]+)/([0-9\.]+)/([0-9\.]+), `)
 	qmgrInsertLine                      = regexp.MustCompile(`:.*, size=(\d+), nrcpt=(\d+) `)
 	smtpTLSLine                         = regexp.MustCompile(`^(\S+) TLS connection established to \S+: (\S+) with cipher (\S+) \((\d+)/(\d+) bits\)$`)
 	smtpdFCrDNSErrorsLine               = regexp.MustCompile(`^warning: hostname \S+ does not resolve to address `)
 	smtpdProcessesSASLLine              = regexp.MustCompile(`: client=.*, sasl_username=(\S+)`)
+	smtpdProcessesStatus                = regexp.MustCompile(`: (to|from)=.*,.*status=(\S+) `)
 	smtpdRejectsLine                    = regexp.MustCompile(`^NOQUEUE: reject: RCPT from \S+: ([0-9]+) `)
 	smtpdLostConnectionLine             = regexp.MustCompile(`^lost connection after (\w+) from `)
 	smtpdSASLAuthenticationFailuresLine = regexp.MustCompile(`^warning: \S+: SASL \S+ authentication failed: `)
@@ -287,8 +289,22 @@ var (
 
 // CollectFromLogline collects metrict from a Postfix log line.
 func (e *PostfixExporter) CollectFromLogline(line string) {
+	// log.Printf("1 Got log: %s", line)
 	// Strip off timestamp, hostname, etc.
+	multiInstanceLabel := "gmail"
 	if logMatches := logLine.FindStringSubmatch(line); logMatches != nil {
+
+		if multiInstanceMatch := multiInstance.FindStringSubmatch(line); multiInstanceMatch != nil {
+			multiInstanceLabel = multiInstanceMatch[1]
+			//log.Printf("multiInstanceMatch matched: %v", multiInstanceMatch)
+		}
+
+		if smtpdProcessesOKmatches := smtpdProcessesStatus.FindStringSubmatch(logMatches[2]); smtpdProcessesOKmatches != nil {
+			//log.Printf("smtpdProcessesOKmatches matched: %v", smtpdProcessesOKmatches)
+			e.smtpdProcesses.WithLabelValues(smtpdProcessesOKmatches[2], multiInstanceLabel).Inc()
+		}
+
+		//log.Printf("3 logmatches: %v", logMatches)
 		// Group patterns to check by Postfix service.
 		if logMatches[1] == "cleanup" {
 			if strings.Contains(logMatches[2], ": message-id=<") {
@@ -349,6 +365,7 @@ func (e *PostfixExporter) CollectFromLogline(line string) {
 				e.unsupportedLogEntries.WithLabelValues(logMatches[1]).Inc()
 			}
 		} else if logMatches[1] == "qmgr" {
+			//log.Printf("2 Qmgr : %v", logMatches)
 			if qmgrInsertMatches := qmgrInsertLine.FindStringSubmatch(logMatches[2]); qmgrInsertMatches != nil {
 				size, err := strconv.ParseFloat(qmgrInsertMatches[1], 64)
 				if err != nil {
@@ -366,6 +383,7 @@ func (e *PostfixExporter) CollectFromLogline(line string) {
 				e.unsupportedLogEntries.WithLabelValues(logMatches[1]).Inc()
 			}
 		} else if logMatches[1] == "smtp" {
+			log.Printf("1 logMatches smtpd matched: %v", logMatches)
 			if smtpMatches := lmtpPipeSMTPLine.FindStringSubmatch(logMatches[2]); smtpMatches != nil {
 				pdelay, err := strconv.ParseFloat(smtpMatches[2], 64)
 				if err != nil {
@@ -393,6 +411,7 @@ func (e *PostfixExporter) CollectFromLogline(line string) {
 				e.unsupportedLogEntries.WithLabelValues(logMatches[1]).Inc()
 			}
 		} else if logMatches[1] == "smtpd" {
+			//log.Printf("logMatches smtpd matched: %v", logMatches)
 			if strings.HasPrefix(logMatches[2], "connect from ") {
 				e.smtpdConnects.Inc()
 			} else if strings.HasPrefix(logMatches[2], "disconnect from ") {
@@ -401,10 +420,12 @@ func (e *PostfixExporter) CollectFromLogline(line string) {
 				e.smtpdFCrDNSErrors.Inc()
 			} else if smtpdLostConnectionMatches := smtpdLostConnectionLine.FindStringSubmatch(logMatches[2]); smtpdLostConnectionMatches != nil {
 				e.smtpdLostConnections.WithLabelValues(smtpdLostConnectionMatches[1]).Inc()
-			} else if smtpdProcessesSASLMatches := smtpdProcessesSASLLine.FindStringSubmatch(logMatches[2]); smtpdProcessesSASLMatches != nil {
-				e.smtpdProcesses.WithLabelValues(smtpdProcessesSASLMatches[1]).Inc()
-			} else if strings.Contains(logMatches[2], ": client=") {
-				e.smtpdProcesses.WithLabelValues("").Inc()
+				/*} else if smtpdProcessesSASLMatches := smtpdProcessesSASLLine.FindStringSubmatch(logMatches[2]); smtpdProcessesSASLMatches != nil {
+					log.Printf("smtpdProcessesSASLMatches matched: %v", smtpdProcessesSASLMatches)
+					e.smtpdProcesses.WithLabelValues(smtpdProcessesSASLMatches[1], multiInstanceLabel).Inc()
+				} else if strings.Contains(logMatches[2], ": client=") {
+					e.smtpdProcesses.WithLabelValues("", multiInstanceLabel).Inc()
+				*/
 			} else if smtpdRejectsMatches := smtpdRejectsLine.FindStringSubmatch(logMatches[2]); smtpdRejectsMatches != nil {
 				e.smtpdRejects.WithLabelValues(smtpdRejectsMatches[1]).Inc()
 			} else if smtpdSASLAuthenticationFailuresLine.MatchString(logMatches[2]) {
@@ -546,7 +567,7 @@ func NewPostfixExporter(showqPath string, logfilePath string, journal *Journal) 
 				Name:      "smtpd_messages_processed_total",
 				Help:      "Total number of messages processed.",
 			},
-			[]string{"sasl_username"}),
+			[]string{"status", "relay"}),
 		smtpdRejects: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Namespace: "postfix",
@@ -682,6 +703,8 @@ func main() {
 			log.Fatalf("Error opening systemd journal: %s", err)
 		}
 		defer journal.Close()
+	} else {
+		log.Printf("Systemd disabled")
 	}
 
 	exporter, err := NewPostfixExporter(
